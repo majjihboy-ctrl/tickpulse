@@ -135,4 +135,41 @@ describe('AI server endpoint', () => {
         expect(systemPrompt).toContain('Volatility 10=R_10');
         expect(systemPrompt).toContain('Never use an R_ symbol for a (1s) market');
     });
+
+    describe('Gemini native endpoint', () => {
+        const geminiOk = (text: string) => ({ ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text }] } }] }) });
+        beforeEach(() => { process.env.GEMINI_API_KEY = 'gem-test-key'; process.env.GEMINI_MODEL = 'model-a'; jest.spyOn(console, 'error').mockImplementation(() => undefined); });
+        afterEach(() => jest.restoreAllMocks());
+        it('calls generateContent with the key in x-goog-api-key and returns the validated draft', async () => {
+            (fetch as jest.Mock).mockResolvedValueOnce({ ok: true, json: async () => true })
+                .mockResolvedValueOnce(geminiOk(JSON.stringify({ reply: 'Review it', spec })));
+            const r = res(); await handler(req(), r);
+            expect(r.status).toHaveBeenCalledWith(200); expect(r.json).toHaveBeenCalledWith({ reply: 'Review it', spec });
+            const [url, init] = (fetch as jest.Mock).mock.calls[1];
+            expect(url).toBe('https://generativelanguage.googleapis.com/v1beta/models/model-a:generateContent');
+            expect(init.headers['x-goog-api-key']).toBe('gem-test-key');
+            expect(init.headers).not.toHaveProperty('Authorization');
+            expect(JSON.parse(init.body).generationConfig.responseMimeType).toBe('application/json');
+            expect(JSON.stringify(r.json.mock.calls)).not.toContain('gem-test-key');
+        });
+        it('falls through to the next model when a model is missing (404)', async () => {
+            (fetch as jest.Mock).mockResolvedValueOnce({ ok: true, json: async () => true })
+                .mockResolvedValueOnce({ ok: false, status: 404, json: async () => ({ error: { status: 'NOT_FOUND' } }) })
+                .mockResolvedValueOnce(geminiOk(JSON.stringify({ reply: 'Which TP?', spec: null })));
+            const r = res(); await handler(req(), r);
+            expect(r.status).toHaveBeenCalledWith(200);
+            expect((fetch as jest.Mock).mock.calls[2][0]).toContain('/models/gemini-3.8-flash:generateContent');
+        });
+        it('stops on an auth error, logs only the status, and never leaks provider details', async () => {
+            (fetch as jest.Mock).mockResolvedValueOnce({ ok: true, json: async () => true })
+                .mockResolvedValueOnce({ ok: false, status: 403, json: async () => ({ error: { status: 'PERMISSION_DENIED', message: 'private provider detail' } }) });
+            const r = res(); await handler(req(), r);
+            expect(r.status).toHaveBeenCalledWith(502);
+            expect(r.json.mock.calls[0][0].error).toContain('provider is unavailable');
+            expect(JSON.stringify(r.json.mock.calls)).not.toContain('private provider detail');
+            expect((console.error as jest.Mock).mock.calls[0][0]).toContain('HTTP 403 PERMISSION_DENIED');
+            expect(JSON.stringify((console.error as jest.Mock).mock.calls)).not.toContain('gem-test-key');
+            expect(fetch).toHaveBeenCalledTimes(2); // quota + one Gemini attempt, no further models
+        });
+    });
 });

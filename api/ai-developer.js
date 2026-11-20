@@ -33,6 +33,50 @@ const validMessages = messages => Array.isArray(messages) && messages.length > 0
         m.content.trim().length > 0 && m.content.length <= 4000 && !sensitive(m.content)) &&
     JSON.stringify(messages).length <= 24000;
 
+// Gemini is called through its native endpoint (x-goog-api-key header), the same way the working
+// botmaster app does. The OpenAI-compatible endpoint with a Bearer header rejected newer API keys.
+// Models are tried in order; a model that is gone (404), limited (429) or down (5xx) falls through
+// to the next one, while auth/bad-request errors (400/401/403) stop at once.
+const GEMINI_DEFAULT_MODELS = ['gemini-3.8-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'];
+const geminiModels = () => [...new Set([
+    ...(process.env.GEMINI_MODEL || '').split(',').map(m => m.trim()).filter(Boolean),
+    ...GEMINI_DEFAULT_MODELS,
+])];
+
+const callGemini = async (apiKey, messages) => {
+    for (const model of geminiModels()) {
+        let response;
+        try {
+            response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+                body: JSON.stringify({
+                    systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+                    contents: messages.map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })),
+                    generationConfig: { temperature: 0.2, maxOutputTokens: 8192, responseMimeType: 'application/json' },
+                }),
+                signal: AbortSignal.timeout(30000),
+            });
+        } catch {
+            console.error(`ai-developer: gemini ${model} request failed (network/timeout)`);
+            continue;
+        }
+        if (!response.ok) {
+            // Log only the HTTP status and Google's error category, never the key or message text.
+            let category = '';
+            try { category = String((await response.json())?.error?.status || ''); } catch { /* ignore */ }
+            console.error(`ai-developer: gemini ${model} failed: HTTP ${response.status} ${category}`.trim());
+            const retryable = response.status === 404 || response.status === 429 || (response.status >= 500 && response.status < 600);
+            if (!retryable) return { ok: false, reason: 'provider' };
+            continue;
+        }
+        const data = await response.json();
+        const text = (data?.candidates?.[0]?.content?.parts || []).map(p => (typeof p?.text === 'string' ? p.text : '')).join('');
+        if (!text || text.length > 10000) return { ok: false, reason: 'malformed' };
+        try { return { ok: true, answer: JSON.parse(text) }; } catch { return { ok: false, reason: 'malformed' }; }
+    }
+    return { ok: false, reason: 'provider' };
+};
+
 module.exports = async function handler(req, res) {
     if (req.method !== 'POST') { res.setHeader('Allow', 'POST'); return send(res, 405, { error: 'Method not allowed.' }); }
     const host = req.headers.host;
@@ -73,6 +117,7 @@ module.exports = async function handler(req, res) {
     if (allowed !== true) return send(res, 503, { error: 'AI usage protection is unavailable. Reference: Q-RESPONSE.' });
 
     const callModel = async messages => {
+        if (useGemini) return callGemini(GEMINI_API_KEY, messages);
         const response = await fetch(provider.url, {
             method: 'POST', headers: { Authorization: `Bearer ${provider.key}`, 'Content-Type': 'application/json' },
             body: JSON.stringify({ model: provider.model, messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...messages], temperature: 0.2, max_tokens: provider.maxTokens, response_format: { type: 'json_object' } }),
