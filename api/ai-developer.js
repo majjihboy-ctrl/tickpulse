@@ -41,8 +41,13 @@ module.exports = async function handler(req, res) {
     if (!host || origin.host !== host || !['https:', 'http:'].includes(origin.protocol)) return send(res, 403, { error: 'Invalid request origin.' });
     if (!/^application\/json(?:;|$)/i.test(req.headers['content-type'] || '')) return send(res, 415, { error: 'JSON required.' });
     if (!validMessages(req.body?.messages)) return send(res, 400, { error: 'Invalid message or possible credential. Never send API keys or login tokens in chat.' });
-    const { OPENROUTER_API_KEY, AI_LIMIT_SUPABASE_URL, AI_LIMIT_SUPABASE_SERVICE_ROLE_KEY, AI_RATE_LIMIT_SECRET } = process.env;
-    if (!OPENROUTER_API_KEY || !AI_LIMIT_SUPABASE_URL || !AI_LIMIT_SUPABASE_SERVICE_ROLE_KEY || !AI_RATE_LIMIT_SECRET || AI_RATE_LIMIT_SECRET.length < 32)
+    const { OPENROUTER_API_KEY, GEMINI_API_KEY, AI_LIMIT_SUPABASE_URL, AI_LIMIT_SUPABASE_SERVICE_ROLE_KEY, AI_RATE_LIMIT_SECRET } = process.env;
+    // Provider: Google Gemini (OpenAI-compatible endpoint) when GEMINI_API_KEY is set, otherwise OpenRouter.
+    const useGemini = Boolean(GEMINI_API_KEY);
+    const provider = useGemini
+        ? { url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', key: GEMINI_API_KEY, model: process.env.GEMINI_MODEL || 'gemini-2.0-flash', maxTokens: 2048 }
+        : { url: 'https://openrouter.ai/api/v1/chat/completions', key: OPENROUTER_API_KEY, model: process.env.OPENROUTER_MODEL || 'openai/gpt-4o-mini', maxTokens: 900 };
+    if (!provider.key || !AI_LIMIT_SUPABASE_URL || !AI_LIMIT_SUPABASE_SERVICE_ROLE_KEY || !AI_RATE_LIMIT_SECRET || AI_RATE_LIMIT_SECRET.length < 32)
         return send(res, 503, { error: 'AI Developer is not configured yet. Please contact the site owner.' });
     // Vercel supplies this header at the edge. Never send raw IP addresses to the database.
     const ip = (req.headers['x-vercel-forwarded-for'] || '').split(',')[0].trim();
@@ -68,9 +73,9 @@ module.exports = async function handler(req, res) {
     if (allowed !== true) return send(res, 503, { error: 'AI usage protection is unavailable. Reference: Q-RESPONSE.' });
 
     const callModel = async messages => {
-        const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-            method: 'POST', headers: { Authorization: `Bearer ${OPENROUTER_API_KEY}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model: process.env.OPENROUTER_MODEL || 'openai/gpt-4o-mini', messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...messages], temperature: 0.2, max_tokens: 900, response_format: { type: 'json_object' } }),
+        const response = await fetch(provider.url, {
+            method: 'POST', headers: { Authorization: `Bearer ${provider.key}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model: provider.model, messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...messages], temperature: 0.2, max_tokens: provider.maxTokens, response_format: { type: 'json_object' } }),
             signal: AbortSignal.timeout(30000),
         });
         if (!response.ok) return { ok: false, reason: 'provider' };
